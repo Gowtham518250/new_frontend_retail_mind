@@ -445,13 +445,14 @@ class BillContext {
     final remaining = expectedAmount! - _partialReceived;
     if (remaining <= 0) return BillMatchResult.noContext;
 
-    final tol  = math.max(remaining * 0.05, 2.0);
     final diff = (detected - remaining).abs();
 
-    if (diff <= tol)                          return BillMatchResult.exact;
-    if (detected >= remaining * 0.5 &&
-        detected  < remaining - tol)          return BillMatchResult.partial;
-    if (detected  > expectedAmount! * 2.0)    return BillMatchResult.suspicious;
+    // Business rule: exact means the payment covers the remaining balance.
+    // Any positive payment below the remaining balance is a valid partial
+    // payment. There is deliberately no 50% minimum: ₹2 against ₹10 is valid.
+    if (diff <= math.max(remaining * 0.01, 0.01)) return BillMatchResult.exact;
+    if (detected > 0 && detected < remaining) return BillMatchResult.partial;
+    if (detected > expectedAmount! * 2.0) return BillMatchResult.suspicious;
     return BillMatchResult.mismatch;
   }
 }

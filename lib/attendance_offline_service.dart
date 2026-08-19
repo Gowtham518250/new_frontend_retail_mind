@@ -283,17 +283,22 @@ class OfflineAttendanceService {
           .toList();
       final local = await loadLocalRecords();
       final merged = <String, Map<String, dynamic>>{};
-      for (final r in [...local, ...remote]) {
+
+      // Server state is authoritative after login/reload. A local record may
+      // override the server only while it is explicitly pending and therefore
+      // represents an operation that has not reached the backend yet.
+      for (final r in remote) {
         final key = '${r['worker_id'] ?? r['employee_id'] ?? uid}:${r['attendance_date'] ?? ''}';
-        final previous = merged[key];
-        if (previous == null) {
+        merged[key] = {...r, 'local_pending': false};
+      }
+      for (final r in local) {
+        if (r['local_pending'] != true) continue;
+        final key = '${r['worker_id'] ?? r['employee_id'] ?? uid}:${r['attendance_date'] ?? ''}';
+        final server = merged[key];
+        if (server == null) {
           merged[key] = r;
-        } else if (r['local_pending'] == true && previous['local_pending'] != true) {
-          merged[key] = r;
-        } else if (previous['local_pending'] == true) {
-          merged[key] = {...r, ...previous, 'local_pending': true};
         } else {
-          merged[key] = {...previous, ...r};
+          merged[key] = {...server, ...r, 'local_pending': true};
         }
       }
       await _saveRecords(merged.values.toList());
