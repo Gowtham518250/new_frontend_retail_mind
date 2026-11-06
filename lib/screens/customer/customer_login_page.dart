@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../api_client.dart';
+import '../../secure_token_storage.dart';
 import 'nearby_shops_page.dart';
 
 class CustomerLoginPage extends StatefulWidget {
@@ -49,7 +50,14 @@ class _CustomerLoginPageState extends State<CustomerLoginPage> {
           final refreshTokenValue = data['refresh_token'];
           final prefs = await SharedPreferences.getInstance();
           if (tokenValue != null) {
-            await prefs.setString('auth_token', tokenValue.toString());
+            final customerToken = tokenValue.toString();
+            await prefs.setString('auth_token', customerToken);
+            await prefs.setString('role', 'customer');
+            final customerId = int.tryParse(data['customer_id']?.toString() ?? '');
+            if (customerId != null && customerId > 0) {
+              await prefs.setInt('current_scoped_user_id', customerId);
+            }
+            await SecureTokenStorage.saveCustomerToken(customerToken);
           }
           if (refreshTokenValue != null) {
             await prefs.setString('refresh_token', refreshTokenValue.toString());
@@ -58,6 +66,10 @@ class _CustomerLoginPageState extends State<CustomerLoginPage> {
           await prefs.setString('user_type', 'CUSTOMER');
           await prefs.setString('user_name', data['name'] ?? data['user_name'] ?? '');
           await prefs.setString('user_email', _emailController.text.trim());
+          await prefs.setString('customer_email', _emailController.text.trim());
+          if (_phoneController.text.trim().isNotEmpty) {
+            await prefs.setString('customer_phone', _phoneController.text.trim());
+          }
           
           if (mounted) {
             Navigator.pushReplacement(
