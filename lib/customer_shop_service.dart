@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'api_client.dart';
+import 'secure_token_storage.dart';
 import 'online_order_service.dart';
 
 /// Loads products for a customer's selected online shop.
@@ -93,7 +95,9 @@ class CustomerShopService {
     };
   }
 
-  /// Place order in Firestore for owner to see in Online Orders tab.
+  /// Create the canonical customer order in FastAPI/PostgreSQL.
+  /// Never fall back to a Firestore-only order: Cashfree callbacks must map
+  /// to the same server-side order and payment ledger.
   static Future<String> placeOrder({
     required String shopId,
     required String shopName,
@@ -101,43 +105,108 @@ class CustomerShopService {
     required List<Map<String, dynamic>> items,
     required double totalAmount,
     required String paymentMethod,
+    required String idempotencyKey,
     String paymentStatus = 'pending',
   }) async {
-    try {
-      final res = await ApiClient.postJson('/store/order', {
-        'shop_id': int.tryParse(shopId) ?? 0,
-        'items': items.map((i) => {
-          'product_id': int.tryParse(i['id'].toString()) ?? 0,
-          'quantity': int.tryParse(i['qty']?.toString() ?? '1') ?? 1
-        }).toList(),
-        'delivery_address': 'Store Pickup', // Default for now
-      });
-      if (res.statusCode == 200 || res.statusCode == 201) {
-        final body = json.decode(res.body);
-        return body['order_id']?.toString() ?? 'ORDER_OK';
-      }
-    } catch (e) {
-      if (kDebugMode) debugPrint('CustomerShopService placeOrder API error: $e');
+    final token = await SecureTokenStorage.getCustomerToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('Customer session expired. Please sign in again.');
     }
-    
-    // Fallback to firestore just in case
-    final doc = await FirebaseFirestore.instance.collection('orders').add({
-      'shop_id': shopId,
-      'shop_name': shopName,
-      'customer_email': customerEmail,
-      'items': items.map((i) => {
-            'name': i['name'],
-            'qty': i['qty'],
-            'price': i['price'],
-            'id': i['id'],
-          }).toList(),
-      'total_amount': totalAmount,
-      'status': 'Pending',
-      'payment_method': paymentMethod,
-      'payment_status': paymentStatus,
-      'timestamp': FieldValue.serverTimestamp(),
-    });
-    return doc.id;
+
+    final response = await http.post(
+      Uri.parse('${ApiClient.baseUrl}/store/order'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'shop_id': int.tryParse(shopId) ?? 0,
+        'items': items.map((item) => {
+          'product_id': int.tryParse(item['id'].toString()) ?? 0,
+          'quantity': int.tryParse(item['qty']?.toString() ?? '1') ?? 1,
+        }).toList(),
+        'delivery_address': 'Store Pickup',
+        'payment_method': paymentMethod.toUpperCase() == 'UPI' ? 'UPI' : 'COD',
+        'idempotency_key': idempotencyKey,
+      }),
+    ).timeout(const Duration(seconds: 30));
+
+    final body = _decodeResponse(response.body);
+    if (response.statusCode != 200 && response.statusCode != 201) {
+      final detail = body['detail'] ?? body['message'];
+      throw Exception(detail?.toString() ?? 'Unable to create the online order.');
+    }
+    final orderId = body['order_id']?.toString();
+    if (orderId == null || orderId.isEmpty || orderId == 'ORDER_OK') {
+      throw Exception('The backend did not return a valid order ID.');
+    }
+    return orderId;
+  }
+
+  /// Read the public shop configuration before showing payment methods.
+  static Future<Map<String, bool>> fetchShopPaymentOptions(String shopId) async {
+    final response = await http.get(
+      Uri.parse('${ApiClient.baseUrl}/store/shops/$shopId/products?limit=1'),
+    ).timeout(const Duration(seconds: 15));
+    final body = _decodeResponse(response.body);
+    if (response.statusCode != 200) {
+      throw Exception('Unable to load this shop’s payment options.');
+    }
+    return {
+      'accept_cod': body['accept_cod'] == true,
+      'accept_online': body['accept_online'] == true,
+    };
+  }
+
+  /// Ask the backend to create/reuse the Cashfree session for this saved order.
+  static Future<Map<String, dynamic>> createCashfreeCheckoutSession(
+    String orderId,
+  ) async {
+    final token = await SecureTokenStorage.getCustomerToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('Customer session expired. Please sign in again.');
+    }
+    final response = await http.post(
+      Uri.parse('${ApiClient.baseUrl}/store/order/$orderId/cashfree/session'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'Content-Type': 'application/json',
+      },
+    ).timeout(const Duration(seconds: 30));
+    final body = _decodeResponse(response.body);
+    if (response.statusCode != 200 || body['success'] != true) {
+      throw Exception(body['detail']?.toString() ?? 'Unable to start secure checkout.');
+    }
+    return body;
+  }
+
+  /// Confirm SDK callbacks against the backend/provider APIs.
+  static Future<Map<String, dynamic>> getCashfreePaymentStatus(
+    String orderId,
+  ) async {
+    final token = await SecureTokenStorage.getCustomerToken();
+    if (token == null || token.trim().isEmpty) {
+      throw Exception('Customer session expired. Please sign in again.');
+    }
+    final response = await http.get(
+      Uri.parse('${ApiClient.baseUrl}/store/order/$orderId/cashfree/status'),
+      headers: {'Authorization': 'Bearer $token'},
+    ).timeout(const Duration(seconds: 20));
+    final body = _decodeResponse(response.body);
+    if (response.statusCode != 200) {
+      throw Exception(body['detail']?.toString() ?? 'Unable to verify payment status.');
+    }
+    return body;
+  }
+
+  static Map<String, dynamic> _decodeResponse(String raw) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      // Do not expose arbitrary HTML/error payloads to the customer.
+    }
+    return <String, dynamic>{};
   }
 
   /// Push owner inventory row to Firestore (stock + image for storefront).
