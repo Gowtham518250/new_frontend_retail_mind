@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:uuid/uuid.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfpayment/cfwebcheckoutpayment.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfpaymentgateway/cfpaymentgatewayservice.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cfsession/cfsession.dart';
+import 'package:flutter_cashfree_pg_sdk/api/cferrorresponse/cferrorresponse.dart';
+import 'package:flutter_cashfree_pg_sdk/utils/cfenums.dart';
 import '../../visual_widgets.dart';
 import '../../customer_shop_service.dart';
-import '../../online_order_service.dart';
 
 class CustomerCartPage extends StatefulWidget {
   final List<Map<String, dynamic>> cartItems;
@@ -25,57 +28,65 @@ class CustomerCartPage extends StatefulWidget {
 class _CustomerCartPageState extends State<CustomerCartPage> {
   late List<Map<String, dynamic>> _items;
   bool _isPlacingOrder = false;
-  String _paymentMode = 'upi';
-  String? _shopUpi;
-  bool _loadingUpi = true;
+  bool _loadingPaymentOptions = true;
+  bool _acceptCod = false;
+  bool _acceptOnline = false;
+  bool _awaitingPayment = false;
+  String _paymentMode = 'cod';
+  String? _activeOrderId;
+  late final String _checkoutIdempotencyKey;
+  final CFPaymentGatewayService _cashfreeGateway = CFPaymentGatewayService();
 
   @override
   void initState() {
     super.initState();
     _items = List<Map<String, dynamic>>.from(widget.cartItems);
-    _loadUpi();
+    _checkoutIdempotencyKey = 'flutter-${const Uuid().v4()}';
+    _cashfreeGateway.setCallback(_onCashfreeVerify, _onCashfreeError);
+    _loadPaymentOptions();
   }
 
-  Future<void> _loadUpi() async {
-    final upi = await OnlineOrderService.fetchShopUpi(widget.shopId);
-    if (!mounted) return;
-    setState(() {
-      _shopUpi = upi;
-      _loadingUpi = false;
-      if (upi == null || upi.isEmpty) _paymentMode = 'cod';
-    });
+  Future<void> _loadPaymentOptions() async {
+    try {
+      final options = await CustomerShopService.fetchShopPaymentOptions(widget.shopId);
+      if (!mounted) return;
+      setState(() {
+        _acceptCod = options['accept_cod'] == true;
+        _acceptOnline = options['accept_online'] == true;
+        _paymentMode = (!_acceptCod && _acceptOnline) ? 'upi' : 'cod';
+        _loadingPaymentOptions = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _acceptCod = false;
+        _acceptOnline = false;
+        _loadingPaymentOptions = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unable to load shop payment options: $error')),
+      );
+    }
   }
 
   double get _totalAmount {
     return _items.fold(0.0, (sum, item) => sum + (item['price'] as num) * (item['qty'] as num));
   }
 
-  String get _upiPayUri {
-    final upi = _shopUpi ?? '';
-    return 'upi://pay?pa=$upi&pn=${Uri.encodeComponent(widget.shopName)}'
-        '&am=${_totalAmount.toStringAsFixed(2)}&cu=INR'
-        '&tn=Order-${DateTime.now().millisecondsSinceEpoch % 100000}';
-  }
-
-  Future<void> _openUpiApp() async {
-    final uri = Uri.parse(_upiPayUri);
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    }
-  }
-
   Future<void> _placeOrder() async {
+    if (_isPlacingOrder || _loadingPaymentOptions) return;
     setState(() => _isPlacingOrder = true);
 
     try {
       final prefs = await SharedPreferences.getInstance();
-      final role = prefs.getString('role');
-      final String email = role == 'customer'
-          ? (prefs.getString('customer_email') ??
-              '${prefs.getString('customer_phone') ?? 'guest'}@customer.local')
-          : (prefs.getString('customer_email') ?? 'guest@customer.local');
+      final email = prefs.getString('customer_email') ??
+          prefs.getString('user_email') ??
+          'customer@retailmind.local';
 
-      final paymentStatus = _paymentMode == 'cod' ? 'cod' : 'pending';
+      if (_paymentMode == 'upi' && _activeOrderId != null) {
+        await _launchCashfreeCheckout(_activeOrderId!);
+        return;
+      }
 
       final orderId = await CustomerShopService.placeOrder(
         shopId: widget.shopId,
@@ -83,35 +94,118 @@ class _CustomerCartPageState extends State<CustomerCartPage> {
         customerEmail: email,
         items: _items,
         totalAmount: _totalAmount,
-        paymentMethod: _paymentMode,
-        paymentStatus: paymentStatus,
+        paymentMethod: _paymentMode == 'upi' ? 'UPI' : 'COD',
+        idempotencyKey: _checkoutIdempotencyKey,
       );
-
       await prefs.setString('last_online_order_id', orderId);
-
       if (!mounted) return;
 
-      if (_paymentMode == 'upi' && _shopUpi != null && _shopUpi!.isNotEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Order placed! Pay via UPI — we will confirm when payment is received.'),
-            duration: Duration(seconds: 4),
-          ),
+      if (_paymentMode == 'upi') {
+        _activeOrderId = orderId;
+        await _launchCashfreeCheckout(orderId);
+      } else {
+        Navigator.pushReplacementNamed(
+          context,
+          '/order-tracking',
+          arguments: {'orderId': orderId},
         );
       }
-
-      Navigator.pushReplacementNamed(
-        context,
-        '/order-tracking',
-        arguments: {'orderId': orderId},
-      );
-    } catch (e) {
+    } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Order failed: $e'), backgroundColor: Colors.red),
+        SnackBar(
+          content: Text('Order/payment could not be started: $error'),
+          backgroundColor: Colors.red,
+        ),
       );
-      setState(() => _isPlacingOrder = false);
+    } finally {
+      if (mounted) setState(() => _isPlacingOrder = false);
     }
+  }
+
+  Future<void> _launchCashfreeCheckout(String retailMindOrderId) async {
+    final response = await CustomerShopService.createCashfreeCheckoutSession(
+      retailMindOrderId,
+    );
+    final providerOrderId = response['cashfree_order_id']?.toString() ?? '';
+    final paymentSessionId = response['payment_session_id']?.toString() ?? '';
+    if (providerOrderId.isEmpty || paymentSessionId.isEmpty) {
+      throw Exception('Cashfree did not return a valid checkout session.');
+    }
+
+    final envName = (response['environment'] ?? 'sandbox').toString().toLowerCase();
+    final environment = envName == 'production'
+        ? CFEnvironment.PRODUCTION
+        : CFEnvironment.SANDBOX;
+    final session = CFSessionBuilder()
+        .setEnvironment(environment)
+        .setOrderId(providerOrderId)
+        .setPaymentSessionId(paymentSessionId)
+        .build();
+    final checkout = CFWebCheckoutPaymentBuilder()
+        .setSession(session)
+        .build();
+
+    _cashfreeGateway.setCallback(_onCashfreeVerify, _onCashfreeError);
+    _cashfreeGateway.doPayment(checkout);
+    if (mounted) setState(() => _awaitingPayment = true);
+  }
+
+  void _onCashfreeVerify(String providerOrderId) {
+    final orderId = _activeOrderId;
+    if (orderId != null) _confirmCashfreePayment(orderId);
+  }
+
+  void _onCashfreeError(CFErrorResponse errorResponse, String providerOrderId) {
+    final orderId = _activeOrderId;
+    if (orderId == null) return;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Cashfree checkout response: ${errorResponse.getMessage()}')),
+      );
+    }
+    _confirmCashfreePayment(orderId);
+  }
+
+  Future<void> _confirmCashfreePayment(String orderId) async {
+    for (var attempt = 0; attempt < 5; attempt++) {
+      try {
+        final status = await CustomerShopService.getCashfreePaymentStatus(orderId);
+        if (status['paid'] == true) {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('last_online_order_id', orderId);
+          if (!mounted) return;
+          setState(() {
+            _awaitingPayment = false;
+            _activeOrderId = null;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Payment verified. Your order is confirmed.'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          Navigator.pushReplacementNamed(
+            context,
+            '/order-tracking',
+            arguments: {'orderId': orderId},
+          );
+          return;
+        }
+      } catch (_) {
+        // Keep the order unpaid unless the backend confirms it.
+      }
+      if (attempt < 4) await Future.delayed(const Duration(seconds: 2));
+    }
+
+    if (!mounted) return;
+    setState(() => _awaitingPayment = true);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Payment is not confirmed yet. Your order remains unpaid; retry secure payment or check Order Tracking.'),
+        duration: Duration(seconds: 6),
+      ),
+    );
   }
 
   @override
@@ -174,62 +268,68 @@ class _CustomerCartPageState extends State<CustomerCartPage> {
                       const SizedBox(height: 8),
                       const Text('Payment method', style: TextStyle(color: Colors.white70, fontSize: 14)),
                       const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: ChoiceChip(
-                              label: const Text('Pay via UPI'),
-                              selected: _paymentMode == 'upi',
-                              onSelected: _shopUpi == null
-                                  ? null
-                                  : (_) => setState(() => _paymentMode = 'upi'),
-                              selectedColor: AppColors.primary,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: ChoiceChip(
-                              label: const Text('Cash on delivery'),
-                              selected: _paymentMode == 'cod',
-                              onSelected: (_) => setState(() => _paymentMode = 'cod'),
-                              selectedColor: AppColors.primary,
-                            ),
-                          ),
-                        ],
-                      ),
-                      if (_paymentMode == 'upi' && !_loadingUpi) ...[
-                        const SizedBox(height: 16),
-                        if (_shopUpi == null || _shopUpi!.isEmpty)
-                          const Text(
-                            'Shop has no UPI ID — use Cash on delivery.',
-                            style: TextStyle(color: Colors.orangeAccent, fontSize: 12),
-                          )
-                        else ...[
-                          Center(
-                            child: Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.circular(12),
+                      if (_loadingPaymentOptions)
+                        const LinearProgressIndicator()
+                      else if (!_acceptCod && !_acceptOnline)
+                        const Text(
+                          'This shop has not enabled online checkout payments yet.',
+                          style: TextStyle(color: Colors.orangeAccent, fontSize: 12),
+                        )
+                      else
+                        Row(
+                          children: [
+                            if (_acceptOnline)
+                              Expanded(
+                                child: ChoiceChip(
+                                  label: const Text('Secure online payment'),
+                                  selected: _paymentMode == 'upi',
+                                  onSelected: (_) => setState(() => _paymentMode = 'upi'),
+                                  selectedColor: AppColors.primary,
+                                ),
                               ),
-                              child: QrImageView(
-                                data: _upiPayUri,
-                                size: 160,
-                                backgroundColor: Colors.white,
+                            if (_acceptOnline && _acceptCod) const SizedBox(width: 8),
+                            if (_acceptCod)
+                              Expanded(
+                                child: ChoiceChip(
+                                  label: const Text('Cash on delivery'),
+                                  selected: _paymentMode == 'cod',
+                                  onSelected: (_) => setState(() => _paymentMode = 'cod'),
+                                  selectedColor: AppColors.primary,
+                                ),
                               ),
-                            ),
+                          ],
+                        ),
+                      if (_paymentMode == 'upi' && _acceptOnline) ...[
+                        const SizedBox(height: 12),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.white24),
                           ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Scan & pay ₹${_totalAmount.toStringAsFixed(2)} to $_shopUpi',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(color: Colors.white70, fontSize: 12),
+                          child: const Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Icon(Icons.verified_user_outlined, color: AppColors.primary),
+                              SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  'Secure checkout powered by Cashfree. Choose an available payment method in the hosted checkout. Retail Mind confirms payment with the server before showing it as paid.',
+                                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                                ),
+                              ),
+                            ],
                           ),
-                          TextButton(
-                            onPressed: _openUpiApp,
-                            child: const Text('Open UPI app'),
-                          ),
-                        ],
+                        ),
+                      ],
+                      if (_activeOrderId != null && _awaitingPayment) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Payment is pending for order #$_activeOrderId. You can retry without placing another order.',
+                          style: const TextStyle(color: Colors.orangeAccent, fontSize: 12),
+                        ),
                       ],
                     ],
                   ),
@@ -260,7 +360,7 @@ class _CustomerCartPageState extends State<CustomerCartPage> {
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton(
-                          onPressed: _isPlacingOrder ? null : _placeOrder,
+                          onPressed: (_isPlacingOrder || _loadingPaymentOptions || (!_acceptCod && !_acceptOnline)) ? null : _placeOrder,
                           style: ElevatedButton.styleFrom(
                             backgroundColor: AppColors.primary,
                             padding: const EdgeInsets.symmetric(vertical: 16),
@@ -273,7 +373,9 @@ class _CustomerCartPageState extends State<CustomerCartPage> {
                                   child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
                                 )
                               : Text(
-                                  _paymentMode == 'upi' ? 'Place order & pay UPI' : 'Place order (COD)',
+                                  _paymentMode == 'upi'
+                                      ? (_activeOrderId == null ? 'Place order & pay securely' : 'Retry secure payment')
+                                      : 'Place order (COD)',
                                   style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                                 ),
                         ),
